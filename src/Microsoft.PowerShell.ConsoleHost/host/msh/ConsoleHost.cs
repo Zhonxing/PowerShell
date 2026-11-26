@@ -124,6 +124,11 @@ namespace Microsoft.PowerShell
             {
                 return AdbDeviceWatcher.RunWatchLoop();
             }
+
+            if (s_cpp.CommandPanel)
+            {
+                return CommandPanelLauncher.RunPanelProcess(s_cpp.CommandPanelTarget);
+            }
 #endif
 
             // Put pwsh executable home in front of PATH so that calling `pwsh` within `pwsh` always starts the same running version.
@@ -332,6 +337,7 @@ namespace Microsoft.PowerShell
                 if (!s_cpp.NonInteractive && s_cpp.InitialCommand == null && s_cpp.File == null)
                 {
                     AdbDeviceWatcher.EnsureWatcherRunningAsync();
+                    CommandPanelLauncher.EnsurePanelRunningAsync(forceShow: false);
                 }
 #endif
 

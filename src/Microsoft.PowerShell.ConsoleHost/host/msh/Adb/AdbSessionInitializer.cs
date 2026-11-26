@@ -123,6 +123,41 @@ Remove-ItemProperty -Path $runKey -Name 'SuperPowerShellAdbWatch' -ErrorAction S
 Write-Host '已关闭开机自动同步 Windows Terminal ADB 设备列表。' -ForegroundColor Yellow
 ";
 
+        private const string CmdPanelFunctionBody = @"
+param(
+    [switch]$Close,
+    [switch]$Config
+)
+if ($Config) {
+    $cfgPath = Join-Path (Join-Path $env:APPDATA 'SuperPowerShell') 'commands.json'
+    if (Test-Path $cfgPath) {
+        Start-Process -FilePath $cfgPath
+    }
+    else {
+        Write-Warning ""配置文件尚未生成: $cfgPath，请先运行 cmd-panel。""
+    }
+    return
+}
+if ($Close) {
+    try {
+        $ev = [System.Threading.EventWaitHandle]::OpenExisting('Local\SuperPowerShell.CommandPanel.Close.v1')
+        $null = $ev.Set()
+        $ev.Dispose()
+    }
+    catch {}
+    return
+}
+try {
+    $ev = [System.Threading.EventWaitHandle]::OpenExisting('Local\SuperPowerShell.CommandPanel.Show.v1')
+    $null = $ev.Set()
+    $ev.Dispose()
+    return
+}
+catch {}
+$pwsh = [System.Environment]::ProcessPath
+Start-Process -FilePath $pwsh -ArgumentList @('-CommandPanel') -WindowStyle Hidden
+";
+
         /// <summary>
         /// Applies ADB PATH fallback, ANDROID_SERIAL binding, and console title before Runspace startup.
         /// </summary>
@@ -160,6 +195,7 @@ Write-Host '已关闭开机自动同步 Windows Terminal ADB 设备列表。' -F
             ReplaceOrAddFunction(iss, "adb-open", AdbOpenFunctionBody);
             ReplaceOrAddFunction(iss, "Enable-AdbTerminalSync", EnableAdbTerminalSyncFunctionBody);
             ReplaceOrAddFunction(iss, "Disable-AdbTerminalSync", DisableAdbTerminalSyncFunctionBody);
+            ReplaceOrAddFunction(iss, "cmd-panel", CmdPanelFunctionBody);
         }
 
         private static void ReplaceOrAddFunction(InitialSessionState iss, string name, string body)

@@ -455,6 +455,24 @@ namespace Microsoft.PowerShell
             }
         }
 
+        internal bool CommandPanel
+        {
+            get
+            {
+                AssertArgumentsParsed();
+                return _commandPanel;
+            }
+        }
+
+        internal long CommandPanelTarget
+        {
+            get
+            {
+                AssertArgumentsParsed();
+                return _commandPanelTarget;
+            }
+        }
+
         internal bool ServerMode
         {
             get
@@ -1045,6 +1063,27 @@ namespace Microsoft.PowerShell
                     _showBanner = false;
                     _noInteractive = true;
                     _skipUserInit = true;
+                }
+                else if (MatchSwitch(switchKey, "commandpanel", "commandpanel"))
+                {
+                    _commandPanel = true;
+                    _showBanner = false;
+                    _noInteractive = true;
+                    _skipUserInit = true;
+                }
+                else if (MatchSwitch(switchKey, "commandpaneltarget", "commandpaneltarget"))
+                {
+                    ++i;
+                    if (i >= args.Length)
+                    {
+                        SetCommandLineError("Missing argument for -CommandPanelTarget.");
+                        break;
+                    }
+
+                    if (long.TryParse(args[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out long hwndValue))
+                    {
+                        _commandPanelTarget = hwndValue;
+                    }
                 }
                 else if (MatchSwitch(switchKey, "adbdevice", "adbdevice"))
                 {
@@ -1706,6 +1745,8 @@ namespace Microsoft.PowerShell
 
         private string? _adbDevice;
         private bool _adbWatch;
+        private bool _commandPanel;
+        private long _commandPanelTarget;
         private bool _socketServerMode;
 #if !UNIX
         private bool _v2SocketServerMode;

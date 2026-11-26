@@ -99,11 +99,15 @@ namespace Microsoft.PowerShell.Adb
                 return;
             }
 
+            var activeProfiles = new List<(string Guid, string Name)>(deviceSerials.Count + 1);
+            string baseGuid = FormatGuid(CreateDeterministicGuid("base:SuperPowerShell"));
+            activeProfiles.Add((baseGuid, "SuperPowerShell"));
+
             var profiles = new List<Dictionary<string, object>>(deviceSerials.Count + 1)
             {
                 new Dictionary<string, object>
                 {
-                    ["guid"] = FormatGuid(CreateDeterministicGuid("base:SuperPowerShell")),
+                    ["guid"] = baseGuid,
                     ["name"] = "SuperPowerShell",
                     ["commandline"] = $"\"{pwshPath}\" -NoLogo",
                 },
@@ -116,9 +120,12 @@ namespace Microsoft.PowerShell.Adb
                     continue;
                 }
 
+                string devGuid = FormatGuid(CreateDeterministicGuid("device:" + serial));
+                activeProfiles.Add((devGuid, serial));
+
                 profiles.Add(new Dictionary<string, object>
                 {
-                    ["guid"] = FormatGuid(CreateDeterministicGuid("device:" + serial)),
+                    ["guid"] = devGuid,
                     ["name"] = serial,
                     ["tabTitle"] = serial,
                     ["suppressApplicationTitle"] = true,
@@ -141,6 +148,7 @@ namespace Microsoft.PowerShell.Adb
 
             Directory.CreateDirectory(dir);
 
+            bool fragmentChanged = true;
             if (File.Exists(fragmentPath))
             {
                 try
@@ -148,7 +156,7 @@ namespace Microsoft.PowerShell.Adb
                     string existing = File.ReadAllText(fragmentPath, Encoding.UTF8);
                     if (string.Equals(existing, json, StringComparison.Ordinal))
                     {
-                        return;
+                        fragmentChanged = false;
                     }
                 }
                 catch
@@ -157,18 +165,22 @@ namespace Microsoft.PowerShell.Adb
                 }
             }
 
-            string tempPath = fragmentPath + ".tmp";
-            File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(tempPath, fragmentPath, overwrite: true);
+            if (fragmentChanged)
+            {
+                string tempPath = fragmentPath + ".tmp";
+                File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                File.Move(tempPath, fragmentPath, overwrite: true);
+            }
 
-            NotifyWindowsTerminalReload();
+            SyncWindowsTerminalSettings(activeProfiles, forceTouch: fragmentChanged);
         }
 
         /// <summary>
-        /// Touches Windows Terminal settings.json timestamp (without modifying contents) so WT's
-        /// FileSystemWatcher immediately hot-reloads updated Fragments into the + dropdown menu.
+        /// Synchronizes active SuperPowerShell profile stubs in Windows Terminal's settings.json
+        /// so WT immediately hot-reloads new/reconnected devices even when WT holds generatedProfiles in memory,
+        /// and removes disconnected SuperPowerShell device stubs to prevent settings.json bloat.
         /// </summary>
-        private static void NotifyWindowsTerminalReload()
+        private static void SyncWindowsTerminalSettings(List<(string Guid, string Name)> activeProfiles, bool forceTouch)
         {
             try
             {
@@ -183,23 +195,113 @@ namespace Microsoft.PowerShell.Adb
                 {
                     foreach (string dir in Directory.EnumerateDirectories(packagesDir, "Microsoft.WindowsTerminal*"))
                     {
-                        string settingsPath = Path.Combine(dir, "LocalState", "settings.json");
-                        if (File.Exists(settingsPath))
-                        {
-                            File.SetLastWriteTimeUtc(settingsPath, DateTime.UtcNow);
-                        }
+                        SyncSingleSettingsFile(Path.Combine(dir, "LocalState", "settings.json"), activeProfiles, forceTouch);
                     }
                 }
 
                 string unpackagedSettings = Path.Combine(localAppData, "Microsoft", "Windows Terminal", "settings.json");
-                if (File.Exists(unpackagedSettings))
-                {
-                    File.SetLastWriteTimeUtc(unpackagedSettings, DateTime.UtcNow);
-                }
+                SyncSingleSettingsFile(unpackagedSettings, activeProfiles, forceTouch);
             }
             catch
             {
                 // Best-effort live reload notification.
+            }
+        }
+
+        private static void SyncSingleSettingsFile(string settingsPath, List<(string Guid, string Name)> activeProfiles, bool forceTouch)
+        {
+            if (!File.Exists(settingsPath))
+            {
+                return;
+            }
+
+            bool modified = false;
+            try
+            {
+                string settingsText = File.ReadAllText(settingsPath, Encoding.UTF8);
+                var docOptions = new JsonDocumentOptions
+                {
+                    CommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true,
+                };
+                var root = System.Text.Json.Nodes.JsonNode.Parse(settingsText, documentOptions: docOptions)?.AsObject();
+                if (root is not null &&
+                    root["profiles"] is System.Text.Json.Nodes.JsonObject profilesObj &&
+                    profilesObj["list"] is System.Text.Json.Nodes.JsonArray listArr)
+                {
+                    var activeGuidSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach ((string guid, _) in activeProfiles)
+                    {
+                        activeGuidSet.Add(guid);
+                    }
+
+                    var existingGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    // 1. Remove disconnected SuperPowerShell stubs; record existing active ones.
+                    for (int i = listArr.Count - 1; i >= 0; i--)
+                    {
+                        if (listArr[i] is not System.Text.Json.Nodes.JsonObject item)
+                        {
+                            continue;
+                        }
+
+                        string? source = item["source"]?.GetValue<string>();
+                        string? guid = item["guid"]?.GetValue<string>();
+
+                        if (!string.IsNullOrEmpty(guid))
+                        {
+                            existingGuids.Add(guid);
+                        }
+
+                        if (string.Equals(source, FragmentAppFolder, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (string.IsNullOrEmpty(guid) || !activeGuidSet.Contains(guid))
+                            {
+                                listArr.RemoveAt(i);
+                                modified = true;
+                            }
+                            else if (item["hidden"]?.GetValue<bool>() == true)
+                            {
+                                item["hidden"] = false;
+                                modified = true;
+                            }
+                        }
+                    }
+
+                    // 2. Append any active SuperPowerShell device missing from settings.json.
+                    foreach ((string guid, string name) in activeProfiles)
+                    {
+                        if (!existingGuids.Contains(guid))
+                        {
+                            var stub = new System.Text.Json.Nodes.JsonObject
+                            {
+                                ["guid"] = guid,
+                                ["hidden"] = false,
+                                ["name"] = name,
+                                ["source"] = FragmentAppFolder,
+                            };
+                            listArr.Add(stub);
+                            modified = true;
+                        }
+                    }
+
+                    if (modified)
+                    {
+                        string tmpPath = settingsPath + ".tmp";
+                        File.WriteAllText(tmpPath, root.ToJsonString(s_jsonOptions), new UTF8Encoding(false));
+                        File.Move(tmpPath, settingsPath, overwrite: true);
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+                // Fall back to timestamp touch if settings.json cannot be parsed.
+            }
+
+            if (forceTouch)
+            {
+                File.SetLastWriteTimeUtc(settingsPath, DateTime.UtcNow);
             }
         }
 
