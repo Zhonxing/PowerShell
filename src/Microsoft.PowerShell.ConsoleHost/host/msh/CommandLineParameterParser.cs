@@ -172,6 +172,8 @@ namespace Microsoft.PowerShell
         internal bool? InputRedirectedTestHook;
 
         private static readonly string[] s_validParameters = {
+            "adbdevice",
+            "adbwatch",
             "sta",
             "mta",
             "command",
@@ -432,6 +434,24 @@ namespace Microsoft.PowerShell
             {
                 AssertArgumentsParsed();
                 return _sshServerMode;
+            }
+        }
+
+        internal string? AdbDevice
+        {
+            get
+            {
+                AssertArgumentsParsed();
+                return _adbDevice;
+            }
+        }
+
+        internal bool AdbWatch
+        {
+            get
+            {
+                AssertArgumentsParsed();
+                return _adbWatch;
             }
         }
 
@@ -1018,6 +1038,24 @@ namespace Microsoft.PowerShell
                         SetCommandLineError(CommandLineParameterParserStrings.FileOnlyEntryServerMode);
                         break;
                     }
+                }
+                else if (MatchSwitch(switchKey, "adbwatch", "adbwatch"))
+                {
+                    _adbWatch = true;
+                    _showBanner = false;
+                    _noInteractive = true;
+                    _skipUserInit = true;
+                }
+                else if (MatchSwitch(switchKey, "adbdevice", "adbdevice"))
+                {
+                    ++i;
+                    if (i >= args.Length)
+                    {
+                        SetCommandLineError("Missing argument for -AdbDevice.");
+                        break;
+                    }
+
+                    _adbDevice = args[i];
                 }
                 else if (MatchSwitch(switchKey, "noprofileloadtime", "noprofileloadtime"))
                 {
@@ -1666,6 +1704,8 @@ namespace Microsoft.PowerShell
             return true;
         }
 
+        private string? _adbDevice;
+        private bool _adbWatch;
         private bool _socketServerMode;
 #if !UNIX
         private bool _v2SocketServerMode;

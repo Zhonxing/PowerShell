@@ -24,6 +24,7 @@ using System.Runtime;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using Microsoft.PowerShell.Adb;
 using Microsoft.PowerShell.Commands;
 using Microsoft.PowerShell.Telemetry;
 #if LEGACYTELEMETRY
@@ -117,6 +118,13 @@ namespace Microsoft.PowerShell
             {
                 throw new ConsoleHostStartupException(ConsoleHostStrings.ShellCannotBeStartedWithConfigConflict);
             }
+
+#if !UNIX
+            if (s_cpp.AdbWatch)
+            {
+                return AdbDeviceWatcher.RunWatchLoop();
+            }
+#endif
 
             // Put pwsh executable home in front of PATH so that calling `pwsh` within `pwsh` always starts the same running version.
             string psExeHome = GetPSExecutableHome();
@@ -318,6 +326,14 @@ namespace Microsoft.PowerShell
 
                 // Send startup telemetry for ConsoleHost startup
                 ApplicationInsightsTelemetry.SendPSCoreStartupTelemetry("Normal", s_cpp.ParametersUsedAsDouble);
+
+#if !UNIX
+                AdbSessionInitializer.ApplyStartupBinding(s_cpp.AdbDevice);
+                if (!s_cpp.NonInteractive && s_cpp.InitialCommand == null && s_cpp.File == null)
+                {
+                    AdbDeviceWatcher.EnsureWatcherRunningAsync();
+                }
+#endif
 
                 return unchecked((int)s_theConsoleHost.Run(s_cpp, false));
             }
@@ -1766,6 +1782,12 @@ namespace Microsoft.PowerShell
 
                 customConfigurationProvided = true;
             }
+#if !UNIX
+            else
+            {
+                AdbSessionInitializer.RegisterBuiltInFunctions(DefaultInitialSessionState);
+            }
+#endif
 
             try
             {
