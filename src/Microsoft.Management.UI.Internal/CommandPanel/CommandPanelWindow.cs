@@ -43,12 +43,12 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         private nint _targetHwnd;
         private nint _panelHwnd;
         private bool _isDocked = true;
-        private bool _isCurrentlyTopmost;
         private bool _closedByUser;
         private bool _everAttachedToTerminal;
         private int _missingTerminalTicks;
         private string _selectedCategory = "全部";
         private CommandItem? _editingItem;
+        private bool _isInjecting;
 
         private readonly TextBox _searchBox;
         private readonly WrapPanel _categoryPanel;
@@ -212,9 +212,17 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
             _editorCategoryChips = new WrapPanel { Margin = new Thickness(0, 0, 0, 8) };
             editorStack.Children.Add(_editorCategoryChips);
 
-            editorStack.Children.Add(CreateFieldLabel("指令内容"));
-            var (cmdContainer, cmdInput) = CreateRoundedTextBox("例如：shell ip addr show wlan0", isMono: true);
+            editorStack.Children.Add(CreateFieldLabel("指令内容（支持多条，每行一条指令）"));
+            var (cmdContainer, cmdInput) = CreateRoundedTextBox("每行一条指令，例如：\nadb root\nadb remount", isMono: true, multiline: true);
             _commandInput = cmdInput;
+            _commandInput.PreviewKeyDown += (_, e) =>
+            {
+                if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+                {
+                    e.Handled = true;
+                    SaveEditor();
+                }
+            };
             cmdContainer.Margin = new Thickness(0, 3, 0, 10);
             editorStack.Children.Add(cmdContainer);
 
@@ -289,7 +297,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
                 _statusLabel.Foreground = TextMutedBrush;
             };
 
-            _syncTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
+            _syncTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
             _syncTimer.Tick += (_, _) => SyncWithTerminal();
 
             SourceInitialized += (_, _) =>
@@ -439,14 +447,13 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
                 _targetLabel.Text = $"目标：{title}";
             }
 
-            if (Win32TerminalBridge.IsMinimized(_targetHwnd))
+            if (Win32TerminalBridge.IsTargetHiddenOrCloaked(_targetHwnd))
             {
                 if (Visibility == Visibility.Visible)
                 {
                     Visibility = Visibility.Hidden;
                 }
 
-                _isCurrentlyTopmost = false;
                 return;
             }
 
@@ -512,22 +519,10 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
                     Top = desiredTop;
                     Height = desiredHeight;
                 }
-
-                bool isRelatedActive = fg == _targetHwnd || fg == _panelHwnd;
-                if (isRelatedActive)
-                {
-                    if (!_isCurrentlyTopmost || positionChanged || forcePosition)
-                    {
-                        Win32TerminalBridge.SetPanelZOrder(_panelHwnd, aboveTerminal: true, otherForegroundHwnd: IntPtr.Zero);
-                        _isCurrentlyTopmost = true;
-                    }
-                }
-                else if (_isCurrentlyTopmost)
-                {
-                    Win32TerminalBridge.SetPanelZOrder(_panelHwnd, aboveTerminal: false, otherForegroundHwnd: fg);
-                    _isCurrentlyTopmost = false;
-                }
             }
+
+            bool isRelatedActive = fg == _targetHwnd || fg == _panelHwnd;
+            Win32TerminalBridge.SyncPanelZOrder(_panelHwnd, _targetHwnd, fg, isRelatedActive);
         }
 
         private void RefreshCategories()
@@ -626,24 +621,66 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
+            List<string> lines = CommandStore.ParseCommandLines(item.Command);
+            bool isMulti = lines.Count > 1;
+
             var textStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            textStack.Children.Add(new TextBlock
+            var nameRow = new Grid();
+            nameRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            nameRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var nameBlock = new TextBlock
             {
                 Text = item.Name,
                 FontSize = 12.5,
                 FontWeight = FontWeights.SemiBold,
                 Foreground = TextPrimaryBrush,
                 TextTrimming = TextTrimming.CharacterEllipsis,
-            });
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            Grid.SetColumn(nameBlock, 0);
+            nameRow.Children.Add(nameBlock);
+
+            if (isMulti)
+            {
+                var badge = new Border
+                {
+                    Background = HeaderBrush,
+                    BorderBrush = AccentBrush,
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(6),
+                    Padding = new Thickness(5, 1, 5, 1),
+                    Margin = new Thickness(6, 0, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Child = new TextBlock
+                    {
+                        Text = $"{lines.Count}条",
+                        FontSize = 9.5,
+                        Foreground = AccentHoverBrush,
+                    },
+                };
+                Grid.SetColumn(badge, 1);
+                nameRow.Children.Add(badge);
+            }
+
+            textStack.Children.Add(nameRow);
+
+            string previewText = isMulti
+                ? string.Join("  ↵  ", lines)
+                : (lines.Count == 1 ? lines[0] : item.Command);
+            string tooltipText = isMulti
+                ? string.Join(Environment.NewLine, lines.Select((line, idx) => $"{idx + 1}. {line}"))
+                : item.Command;
+
             textStack.Children.Add(new TextBlock
             {
-                Text = item.Command,
+                Text = previewText,
                 FontFamily = MonoFont,
                 FontSize = 11,
                 Foreground = TextMutedBrush,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 Margin = new Thickness(0, 3, 0, 0),
-                ToolTip = item.Command,
+                ToolTip = tooltipText,
             });
 
             card.MouseLeftButtonUp += async (_, e) =>
@@ -666,7 +703,10 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
                 Margin = new Thickness(8, 0, 0, 0),
             };
 
-            var runBtn = CreateRoundedButton("▶", RunGreenBrush, RunGreenHoverBrush, "填入并直接执行（带回车）", cornerRadius: 7, padding: new Thickness(7, 4, 7, 4));
+            string runTooltip = isMulti
+                ? $"按顺序依次执行全部 {lines.Count} 条指令"
+                : "填入并直接执行（带回车）";
+            var runBtn = CreateRoundedButton("▶", RunGreenBrush, RunGreenHoverBrush, runTooltip, cornerRadius: 7, padding: new Thickness(7, 4, 7, 4));
             runBtn.Click += async (_, e) =>
             {
                 e.Handled = true;
@@ -701,19 +741,42 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
 
         private async System.Threading.Tasks.Task TriggerInjectAsync(string command, bool execute)
         {
+            if (_isInjecting)
+            {
+                ShowStatus("正在执行指令，请稍候...", TextMutedBrush);
+                return;
+            }
+
             if (!Win32TerminalBridge.IsValidWindow(_targetHwnd))
             {
                 _targetHwnd = Win32TerminalBridge.FindTerminalWindow(IntPtr.Zero);
             }
 
-            bool ok = await Win32TerminalBridge.InjectCommandAsync(_targetHwnd, command, execute);
-            if (ok)
+            int lineCount = CommandStore.ParseCommandLines(command).Count;
+            _isInjecting = true;
+            try
             {
-                ShowStatus(execute ? "已执行指令" : "已填入命令行", execute ? RunGreenBrush : AccentHoverBrush);
+                if (execute && lineCount > 1)
+                {
+                    ShowStatus($"正在依次执行 {lineCount} 条指令...", AccentHoverBrush);
+                }
+
+                bool ok = await Win32TerminalBridge.InjectCommandAsync(_targetHwnd, command, execute);
+                if (ok)
+                {
+                    string message = execute
+                        ? (lineCount > 1 ? $"已依次执行 {lineCount} 条指令" : "已执行指令")
+                        : (lineCount > 1 ? $"已填入 {lineCount} 条指令（; 分隔）" : "已填入命令行");
+                    ShowStatus(message, execute ? RunGreenBrush : AccentHoverBrush);
+                }
+                else
+                {
+                    ShowStatus("未找到可输入的终端窗口", DangerBrush);
+                }
             }
-            else
+            finally
             {
-                ShowStatus("未找到可输入的终端窗口", DangerBrush);
+                _isInjecting = false;
             }
         }
 
@@ -753,7 +816,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
             {
                 _nameInput.Text = item.Name;
                 _categoryInput.Text = string.IsNullOrWhiteSpace(item.Category) ? "自定义" : item.Category;
-                _commandInput.Text = item.Command;
+                _commandInput.Text = item.Command.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
             }
 
             _editorDrawer.Visibility = Visibility.Visible;
@@ -763,7 +826,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         private void SaveEditor()
         {
             string name = (_nameInput.Text ?? string.Empty).Trim();
-            string cmd = (_commandInput.Text ?? string.Empty).Trim();
+            string cmd = CommandStore.NormalizeCommand(_commandInput.Text);
             string cat = (_categoryInput.Text ?? string.Empty).Trim();
             if (string.IsNullOrEmpty(cat))
             {
@@ -779,7 +842,8 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
 
             if (string.IsNullOrEmpty(name))
             {
-                name = cmd.Length > 24 ? cmd.Substring(0, 24) + "..." : cmd;
+                string firstLine = CommandStore.ParseCommandLines(cmd)[0];
+                name = firstLine.Length > 24 ? firstLine.Substring(0, 24) + "..." : firstLine;
             }
 
             if (_editingItem is null)
@@ -877,7 +941,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
             };
         }
 
-        private static (Border Container, TextBox Input) CreateRoundedTextBox(string placeholder, bool isMono = false)
+        private static (Border Container, TextBox Input) CreateRoundedTextBox(string placeholder, bool isMono = false, bool multiline = false)
         {
             var container = new Border
             {
@@ -897,7 +961,8 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
                 Foreground = TextMutedBrush,
                 Opacity = 0.65,
                 IsHitTestVisible = false,
-                VerticalAlignment = VerticalAlignment.Center,
+                VerticalAlignment = multiline ? VerticalAlignment.Top : VerticalAlignment.Center,
+                TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
             };
 
             var input = new TextBox
@@ -910,8 +975,17 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
                 Padding = new Thickness(0),
                 FontSize = 12,
                 FontFamily = isMono ? MonoFont : UiFont,
-                VerticalContentAlignment = VerticalAlignment.Center,
+                VerticalContentAlignment = multiline ? VerticalAlignment.Top : VerticalAlignment.Center,
+                AcceptsReturn = multiline,
+                TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
+                VerticalScrollBarVisibility = multiline ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled,
             };
+
+            if (multiline)
+            {
+                input.MinHeight = 66;
+                input.MaxHeight = 150;
+            }
 
             input.TextChanged += (_, _) =>
             {

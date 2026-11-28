@@ -33,7 +33,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         public int Version { get; set; } = 1;
 
         [JsonPropertyName("autoLaunch")]
-        public bool AutoLaunch { get; set; } = true;
+        public bool AutoLaunch { get; set; } = false;
 
         [JsonPropertyName("panelWidth")]
         public double PanelWidth { get; set; } = 310;
@@ -60,6 +60,33 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         internal static string GetConfigPath()
         {
             return Path.Combine(GetConfigDirectory(), "commands.json");
+        }
+
+        internal static List<string> ParseCommandLines(string? command)
+        {
+            var lines = new List<string>();
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return lines;
+            }
+
+            string[] rawLines = command.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
+            foreach (string line in rawLines)
+            {
+                string trimmed = line.Trim();
+                if (!string.IsNullOrEmpty(trimmed))
+                {
+                    lines.Add(trimmed);
+                }
+            }
+
+            return lines;
+        }
+
+        internal static string NormalizeCommand(string? command)
+        {
+            List<string> lines = ParseCommandLines(command);
+            return string.Join("\n", lines);
         }
 
         internal static CommandConfig LoadOrCreate()
@@ -111,7 +138,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
             return new CommandConfig
             {
                 Version = 1,
-                AutoLaunch = true,
+                AutoLaunch = false,
                 PanelWidth = 310,
                 Commands = new List<CommandItem>
                 {

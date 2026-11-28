@@ -83,6 +83,51 @@ namespace Microsoft.PowerShell.Adb
         }
 
         /// <summary>
+        /// Toggles the single-instance Command Panel: closes it if already open, or launches it detached otherwise.
+        /// Invoked by `pwsh.exe -CommandPanelToggle` from the Windows Terminal dropdown menu.
+        /// </summary>
+        internal static int TogglePanelProcess()
+        {
+            try
+            {
+                if (IsPanelAlreadyRunning())
+                {
+                    TrySignalEvent(CloseEventName);
+                    return ConsoleHost.ExitCodeSuccess;
+                }
+
+                string? pwshPath = Environment.ProcessPath;
+                if (string.IsNullOrEmpty(pwshPath))
+                {
+                    return ConsoleHost.ExitCodeSuccess;
+                }
+
+                nint targetHwnd = FindCurrentTerminalWindow();
+                string args = targetHwnd != IntPtr.Zero
+                    ? $"-CommandPanel -CommandPanelTarget {targetHwnd.ToInt64()}"
+                    : "-CommandPanel";
+
+                // UseShellExecute = true detaches the panel from the temporary WT tab's ConPTY job object
+                // so the panel stays alive after the trigger tab auto-closes.
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = pwshPath,
+                    Arguments = args,
+                    UseShellExecute = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                };
+
+                Process.Start(startInfo);
+            }
+            catch
+            {
+                // Ignore launch failures so the temporary trigger tab still exits cleanly.
+            }
+
+            return ConsoleHost.ExitCodeSuccess;
+        }
+
+        /// <summary>
         /// Entry point for `pwsh.exe -CommandPanel`. Runs the WPF sidebar on a dedicated STA thread.
         /// </summary>
         internal static int RunPanelProcess(long targetHwnd)

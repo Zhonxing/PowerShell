@@ -464,6 +464,15 @@ namespace Microsoft.PowerShell
             }
         }
 
+        internal bool CommandPanelToggle
+        {
+            get
+            {
+                AssertArgumentsParsed();
+                return _commandPanelToggle;
+            }
+        }
+
         internal long CommandPanelTarget
         {
             get
@@ -1067,6 +1076,13 @@ namespace Microsoft.PowerShell
                 else if (MatchSwitch(switchKey, "commandpanel", "commandpanel"))
                 {
                     _commandPanel = true;
+                    _showBanner = false;
+                    _noInteractive = true;
+                    _skipUserInit = true;
+                }
+                else if (MatchSwitch(switchKey, "commandpaneltoggle", "commandpaneltoggle"))
+                {
+                    _commandPanelToggle = true;
                     _showBanner = false;
                     _noInteractive = true;
                     _skipUserInit = true;
@@ -1746,6 +1762,7 @@ namespace Microsoft.PowerShell
         private string? _adbDevice;
         private bool _adbWatch;
         private bool _commandPanel;
+        private bool _commandPanelToggle;
         private long _commandPanelTarget;
         private bool _socketServerMode;
 #if !UNIX

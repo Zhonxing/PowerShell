@@ -20,6 +20,8 @@ namespace Microsoft.PowerShell.Adb
     {
         private const string FragmentAppFolder = "SuperPowerShell";
         private const string FragmentFileName = "adb-devices.json";
+        private const string CommandPanelProfileName = "指令面板";
+        private const int DefaultMaxTerminalHistorySize = 99999;
 
         // Fixed namespace UUID for deterministic UUIDv5 generation.
         private static readonly Guid s_namespaceGuid = new("8d4b7c2f-5c9e-4c61-a6e2-6b90f3d7a101");
@@ -99,17 +101,31 @@ namespace Microsoft.PowerShell.Adb
                 return;
             }
 
-            var activeProfiles = new List<(string Guid, string Name)>(deviceSerials.Count + 1);
+            var activeProfiles = new List<(string Guid, string Name)>(deviceSerials.Count + 2);
             string baseGuid = FormatGuid(CreateDeterministicGuid("base:SuperPowerShell"));
+            string panelGuid = FormatGuid(CreateDeterministicGuid("tool:CommandPanel"));
             activeProfiles.Add((baseGuid, "SuperPowerShell"));
+            activeProfiles.Add((panelGuid, CommandPanelProfileName));
 
-            var profiles = new List<Dictionary<string, object>>(deviceSerials.Count + 1)
+            int targetHistorySize = ResolveSuperPowerShellHistorySize(baseGuid);
+
+            var profiles = new List<Dictionary<string, object>>(deviceSerials.Count + 2)
             {
                 new Dictionary<string, object>
                 {
                     ["guid"] = baseGuid,
                     ["name"] = "SuperPowerShell",
+                    ["historySize"] = targetHistorySize,
                     ["commandline"] = $"\"{pwshPath}\" -NoLogo",
+                },
+                new Dictionary<string, object>
+                {
+                    ["guid"] = panelGuid,
+                    ["name"] = CommandPanelProfileName,
+                    ["tabTitle"] = CommandPanelProfileName,
+                    ["suppressApplicationTitle"] = true,
+                    ["closeOnExit"] = "always",
+                    ["commandline"] = $"\"{pwshPath}\" -CommandPanelToggle",
                 },
             };
 
@@ -129,6 +145,7 @@ namespace Microsoft.PowerShell.Adb
                     ["name"] = serial,
                     ["tabTitle"] = serial,
                     ["suppressApplicationTitle"] = true,
+                    ["historySize"] = targetHistorySize,
                     ["commandline"] = $"\"{pwshPath}\" -NoLogo -AdbDevice \"{serial}\"",
                 });
             }
@@ -172,22 +189,18 @@ namespace Microsoft.PowerShell.Adb
                 File.Move(tempPath, fragmentPath, overwrite: true);
             }
 
-            SyncWindowsTerminalSettings(activeProfiles, forceTouch: fragmentChanged);
+            SyncWindowsTerminalSettings(activeProfiles, baseGuid, panelGuid, forceTouch: fragmentChanged);
         }
 
-        /// <summary>
-        /// Synchronizes active SuperPowerShell profile stubs in Windows Terminal's settings.json
-        /// so WT immediately hot-reloads new/reconnected devices even when WT holds generatedProfiles in memory,
-        /// and removes disconnected SuperPowerShell device stubs to prevent settings.json bloat.
-        /// </summary>
-        private static void SyncWindowsTerminalSettings(List<(string Guid, string Name)> activeProfiles, bool forceTouch)
+        internal static List<string> GetWindowsTerminalSettingsPaths()
         {
+            var paths = new List<string>();
             try
             {
                 string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 if (string.IsNullOrEmpty(localAppData))
                 {
-                    return;
+                    return paths;
                 }
 
                 string packagesDir = Path.Combine(localAppData, "Packages");
@@ -195,12 +208,135 @@ namespace Microsoft.PowerShell.Adb
                 {
                     foreach (string dir in Directory.EnumerateDirectories(packagesDir, "Microsoft.WindowsTerminal*"))
                     {
-                        SyncSingleSettingsFile(Path.Combine(dir, "LocalState", "settings.json"), activeProfiles, forceTouch);
+                        string path = Path.Combine(dir, "LocalState", "settings.json");
+                        if (File.Exists(path))
+                        {
+                            paths.Add(path);
+                        }
                     }
                 }
 
                 string unpackagedSettings = Path.Combine(localAppData, "Microsoft", "Windows Terminal", "settings.json");
-                SyncSingleSettingsFile(unpackagedSettings, activeProfiles, forceTouch);
+                if (File.Exists(unpackagedSettings))
+                {
+                    paths.Add(unpackagedSettings);
+                }
+            }
+            catch
+            {
+                // Ignore filesystem enumeration failures.
+            }
+
+            return paths;
+        }
+
+        private static int ResolveSuperPowerShellHistorySize(string baseGuid)
+        {
+            var docOptions = new JsonDocumentOptions
+            {
+                CommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true,
+            };
+
+            foreach (string settingsPath in GetWindowsTerminalSettingsPaths())
+            {
+                try
+                {
+                    string settingsText = File.ReadAllText(settingsPath, Encoding.UTF8);
+                    var root = System.Text.Json.Nodes.JsonNode.Parse(settingsText, documentOptions: docOptions)?.AsObject();
+                    if (root?["profiles"] is System.Text.Json.Nodes.JsonObject profilesObj &&
+                        TryReadSuperPowerShellHistorySize(profilesObj, baseGuid, out int configured))
+                    {
+                        return configured;
+                    }
+                }
+                catch
+                {
+                    // Try next settings file or fall back to default.
+                }
+            }
+
+            return DefaultMaxTerminalHistorySize;
+        }
+
+        private static bool TryReadSuperPowerShellHistorySize(
+            System.Text.Json.Nodes.JsonObject profilesObj,
+            string baseGuid,
+            out int historySize)
+        {
+            if (profilesObj["list"] is System.Text.Json.Nodes.JsonArray listArr)
+            {
+                foreach (System.Text.Json.Nodes.JsonNode? node in listArr)
+                {
+                    if (node is not System.Text.Json.Nodes.JsonObject item)
+                    {
+                        continue;
+                    }
+
+                    string? guid = item["guid"]?.GetValue<string>();
+                    string? name = item["name"]?.GetValue<string>();
+                    string? source = item["source"]?.GetValue<string>();
+
+                    bool isBaseProfile =
+                        string.Equals(guid, baseGuid, StringComparison.OrdinalIgnoreCase) ||
+                        (string.Equals(source, FragmentAppFolder, StringComparison.OrdinalIgnoreCase) &&
+                         string.Equals(name, FragmentAppFolder, StringComparison.OrdinalIgnoreCase));
+
+                    if (isBaseProfile && TryGetPositiveInt(item["historySize"], out historySize))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if (profilesObj["defaults"] is System.Text.Json.Nodes.JsonObject defaultsObj &&
+                TryGetPositiveInt(defaultsObj["historySize"], out historySize))
+            {
+                return true;
+            }
+
+            historySize = DefaultMaxTerminalHistorySize;
+            return false;
+        }
+
+        private static bool TryGetPositiveInt(System.Text.Json.Nodes.JsonNode? node, out int value)
+        {
+            value = 0;
+            if (node is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                int parsed = node.GetValue<int>();
+                if (parsed > 0)
+                {
+                    value = parsed;
+                    return true;
+                }
+            }
+            catch
+            {
+                // Ignore non-integer values.
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Synchronizes active SuperPowerShell profile stubs in Windows Terminal's settings.json
+        /// so WT immediately hot-reloads new/reconnected devices even when WT holds generatedProfiles in memory,
+        /// and removes disconnected SuperPowerShell device stubs to prevent settings.json bloat.
+        /// </summary>
+        private static void SyncWindowsTerminalSettings(List<(string Guid, string Name)> activeProfiles, string baseGuid, string panelGuid, bool forceTouch)
+        {
+            try
+            {
+                foreach (string settingsPath in GetWindowsTerminalSettingsPaths())
+                {
+                    SyncSingleSettingsFile(settingsPath, activeProfiles, baseGuid, panelGuid, forceTouch);
+                }
             }
             catch
             {
@@ -208,7 +344,7 @@ namespace Microsoft.PowerShell.Adb
             }
         }
 
-        private static void SyncSingleSettingsFile(string settingsPath, List<(string Guid, string Name)> activeProfiles, bool forceTouch)
+        private static void SyncSingleSettingsFile(string settingsPath, List<(string Guid, string Name)> activeProfiles, string baseGuid, string panelGuid, bool forceTouch)
         {
             if (!File.Exists(settingsPath))
             {
@@ -229,6 +365,10 @@ namespace Microsoft.PowerShell.Adb
                     root["profiles"] is System.Text.Json.Nodes.JsonObject profilesObj &&
                     profilesObj["list"] is System.Text.Json.Nodes.JsonArray listArr)
                 {
+                    int targetHistorySize = TryReadSuperPowerShellHistorySize(profilesObj, baseGuid, out int configured)
+                        ? configured
+                        : DefaultMaxTerminalHistorySize;
+
                     var activeGuidSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     foreach ((string guid, _) in activeProfiles)
                     {
@@ -237,7 +377,7 @@ namespace Microsoft.PowerShell.Adb
 
                     var existingGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-                    // 1. Remove disconnected SuperPowerShell stubs; record existing active ones.
+                    // 1. Remove disconnected SuperPowerShell stubs; sync active ones.
                     for (int i = listArr.Count - 1; i >= 0; i--)
                     {
                         if (listArr[i] is not System.Text.Json.Nodes.JsonObject item)
@@ -260,15 +400,40 @@ namespace Microsoft.PowerShell.Adb
                                 listArr.RemoveAt(i);
                                 modified = true;
                             }
-                            else if (item["hidden"]?.GetValue<bool>() == true)
+                            else
                             {
-                                item["hidden"] = false;
-                                modified = true;
+                                if (item["hidden"]?.GetValue<bool>() == true)
+                                {
+                                    item["hidden"] = false;
+                                    modified = true;
+                                }
+
+                                bool isBaseProfile = string.Equals(guid, baseGuid, StringComparison.OrdinalIgnoreCase);
+                                bool isPanelProfile = string.Equals(guid, panelGuid, StringComparison.OrdinalIgnoreCase);
+                                if (!isPanelProfile)
+                                {
+                                    bool hasHistory = TryGetPositiveInt(item["historySize"], out int currentHistorySize);
+                                    if (isBaseProfile)
+                                    {
+                                        // Preserve user's custom historySize on SuperPowerShell; initialize only if missing.
+                                        if (!hasHistory)
+                                        {
+                                            item["historySize"] = targetHistorySize;
+                                            modified = true;
+                                        }
+                                    }
+                                    else if (!hasHistory || currentHistorySize != targetHistorySize)
+                                    {
+                                        // Keep all dynamic ADB device profiles aligned with SuperPowerShell's historySize.
+                                        item["historySize"] = targetHistorySize;
+                                        modified = true;
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // 2. Append any active SuperPowerShell device missing from settings.json.
+                    // 2. Append any active SuperPowerShell entry missing from settings.json.
                     foreach ((string guid, string name) in activeProfiles)
                     {
                         if (!existingGuids.Contains(guid))
@@ -280,6 +445,11 @@ namespace Microsoft.PowerShell.Adb
                                 ["name"] = name,
                                 ["source"] = FragmentAppFolder,
                             };
+                            if (!string.Equals(guid, panelGuid, StringComparison.OrdinalIgnoreCase))
+                            {
+                                stub["historySize"] = targetHistorySize;
+                            }
+
                             listArr.Add(stub);
                             modified = true;
                         }

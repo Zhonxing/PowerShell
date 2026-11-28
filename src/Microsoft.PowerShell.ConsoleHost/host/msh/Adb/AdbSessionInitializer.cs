@@ -103,7 +103,7 @@ if (-not $Serial) {
 $pwsh = [System.Environment]::ProcessPath
 $wtCmd = Get-Command wt.exe -ErrorAction SilentlyContinue
 if ($wtCmd) {
-    & $wtCmd.Source -w 0 new-tab --title $Serial --suppressApplicationTitle -- $pwsh -NoLogo -AdbDevice $Serial
+    & $wtCmd.Source -w 0 new-tab -p 'SuperPowerShell' --title $Serial --suppressApplicationTitle -- $pwsh -NoLogo -AdbDevice $Serial
 }
 else {
     Start-Process -FilePath $pwsh -ArgumentList @('-NoLogo', '-AdbDevice', $Serial)
@@ -158,12 +158,16 @@ $pwsh = [System.Environment]::ProcessPath
 Start-Process -FilePath $pwsh -ArgumentList @('-CommandPanel') -WindowStyle Hidden
 ";
 
+        private const int MaxPowerShellHistoryCount = 32767;
+        private const int MaxConhostBufferHeight = 9999;
+
         /// <summary>
         /// Applies ADB PATH fallback, ANDROID_SERIAL binding, and console title before Runspace startup.
         /// </summary>
         internal static void ApplyStartupBinding(string? adbDevice)
         {
             AdbLocator.EnsureAdbInPath();
+            TryMaximizeLegacyConsoleBuffer();
 
             string? targetSerial = !string.IsNullOrWhiteSpace(adbDevice)
                 ? adbDevice.Trim()
@@ -183,6 +187,27 @@ Start-Process -FilePath $pwsh -ArgumentList @('-CommandPanel') -WindowStyle Hidd
             }
         }
 
+        private static void TryMaximizeLegacyConsoleBuffer()
+        {
+            // Only adjust buffer height for standalone conhost; Windows Terminal manages scrollback via historySize.
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WT_SESSION")))
+            {
+                return;
+            }
+
+            try
+            {
+                if (!Console.IsOutputRedirected && Console.BufferHeight < MaxConhostBufferHeight)
+                {
+                    Console.SetBufferSize(Console.BufferWidth, MaxConhostBufferHeight);
+                }
+            }
+            catch
+            {
+                // Ignore when running headless or when console host rejects buffer resize.
+            }
+        }
+
         /// <summary>
         /// Registers SuperPowerShell ADB helper functions into the InitialSessionState.
         /// </summary>
@@ -196,6 +221,21 @@ Start-Process -FilePath $pwsh -ArgumentList @('-CommandPanel') -WindowStyle Hidd
             ReplaceOrAddFunction(iss, "Enable-AdbTerminalSync", EnableAdbTerminalSyncFunctionBody);
             ReplaceOrAddFunction(iss, "Disable-AdbTerminalSync", DisableAdbTerminalSyncFunctionBody);
             ReplaceOrAddFunction(iss, "cmd-panel", CmdPanelFunctionBody);
+        }
+
+        /// <summary>
+        /// Applies post-open runspace defaults such as maximizing session command history count.
+        /// </summary>
+        internal static void ApplyRunspaceDefaults(Runspace runspace)
+        {
+            try
+            {
+                runspace.SessionStateProxy.SetVariable("MaximumHistoryCount", MaxPowerShellHistoryCount);
+            }
+            catch
+            {
+                // Ignore if runspace does not permit setting MaximumHistoryCount.
+            }
         }
 
         private static void ReplaceOrAddFunction(InitialSessionState iss, string name, string body)

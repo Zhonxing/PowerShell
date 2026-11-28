@@ -36,10 +36,14 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         internal const string ConsoleWindowClass = "ConsoleWindowClass";
 
         private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+        private const int DWMWA_CLOAKED = 14;
         private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
         private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
         private const int DWMWA_BORDER_COLOR = 34;
         private const int DWMWCP_ROUND = 2;
+        private const int GWL_EXSTYLE = -20;
+        private const long WS_EX_TOPMOST = 0x00000008L;
+        private const uint GW_HWNDPREV = 3;
         private const uint MONITOR_DEFAULTTONEAREST = 2;
         private const uint INPUT_KEYBOARD = 1;
         private const uint KEYEVENTF_KEYUP = 0x0002;
@@ -48,6 +52,7 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         private const uint SWP_NOSIZE = 0x0001;
         private const uint SWP_NOMOVE = 0x0002;
         private const uint SWP_NOACTIVATE = 0x0010;
+        private static readonly nint HWND_BOTTOM = new(1);
         private static readonly nint HWND_TOPMOST = new(-1);
         private static readonly nint HWND_NOTOPMOST = new(-2);
 
@@ -106,6 +111,44 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         internal static bool IsValidWindow(nint hwnd) => hwnd != IntPtr.Zero && IsWindow(hwnd);
 
         internal static bool IsMinimized(nint hwnd) => hwnd != IntPtr.Zero && IsIconic(hwnd);
+
+        internal static bool IsTargetHiddenOrCloaked(nint hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
+            {
+                return true;
+            }
+
+            if (IsIconic(hwnd) || !IsWindowVisible(hwnd))
+            {
+                return true;
+            }
+
+            return IsWindowCloaked(hwnd);
+        }
+
+        internal static bool IsWindowTopmost(nint hwnd)
+        {
+            if (hwnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            nint exStyle = GetWindowLongPtrCompat(hwnd, GWL_EXSTYLE);
+            return (exStyle.ToInt64() & WS_EX_TOPMOST) != 0;
+        }
+
+        private static bool IsWindowCloaked(nint hwnd)
+        {
+            try
+            {
+                return DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         internal static nint GetCurrentForegroundWindow() => GetForegroundWindow();
 
@@ -218,33 +261,117 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         }
 
         /// <summary>
-        /// Dynamically promotes the panel to Topmost (without stealing focus) when the host terminal or panel
-        /// is active, and demotes it behind the active foreground window when the user switches to another app.
+        /// Promotes the panel above the host terminal (via TOPMOST without stealing focus, since Win32 blocks
+        /// non-foreground processes from raising a normal window above another process's foreground window)
+        /// when the terminal or panel is active, and reliably demotes it below covering windows otherwise.
         /// </summary>
-        internal static void SetPanelZOrder(nint panelHwnd, bool aboveTerminal, nint otherForegroundHwnd)
+        internal static void SyncPanelZOrder(nint panelHwnd, nint targetHwnd, nint foregroundHwnd, bool isRelatedActive)
         {
-            if (panelHwnd == IntPtr.Zero)
+            if (panelHwnd == IntPtr.Zero || !IsWindow(panelHwnd))
             {
                 return;
             }
 
-            if (aboveTerminal)
+            bool panelTopmost = IsWindowTopmost(panelHwnd);
+
+            if (isRelatedActive)
             {
-                SetWindowPos(panelHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (!panelTopmost || (targetHwnd != IntPtr.Zero && !IsWindowAbove(panelHwnd, targetHwnd)))
+                {
+                    SetWindowPos(panelHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+
+                return;
             }
-            else
+
+            if (panelTopmost)
             {
                 SetWindowPos(panelHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                if (otherForegroundHwnd != IntPtr.Zero && otherForegroundHwnd != panelHwnd && IsWindow(otherForegroundHwnd))
+            }
+
+            nint insertAfter = FindVisibleNonTopmostWindowAbove(targetHwnd, panelHwnd);
+            if (insertAfter == IntPtr.Zero &&
+                foregroundHwnd != IntPtr.Zero &&
+                foregroundHwnd != panelHwnd &&
+                foregroundHwnd != targetHwnd &&
+                IsWindow(foregroundHwnd) &&
+                IsWindowVisible(foregroundHwnd) &&
+                !IsWindowTopmost(foregroundHwnd))
+            {
+                insertAfter = foregroundHwnd;
+            }
+
+            if (insertAfter != IntPtr.Zero && IsWindowAbove(panelHwnd, insertAfter))
+            {
+                bool moved = SetWindowPos(panelHwnd, insertAfter, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (!moved || IsWindowAbove(panelHwnd, insertAfter))
                 {
-                    SetWindowPos(panelHwnd, otherForegroundHwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    // Fallback when UIPI prevents positioning relative to an elevated foreground window.
+                    SetWindowPos(panelHwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
             }
         }
 
+        private static bool IsWindowAbove(nint upperHwnd, nint lowerHwnd)
+        {
+            if (upperHwnd == IntPtr.Zero || lowerHwnd == IntPtr.Zero || upperHwnd == lowerHwnd)
+            {
+                return false;
+            }
+
+            nint cur = GetWindow(lowerHwnd, GW_HWNDPREV);
+            int guard = 0;
+            while (cur != IntPtr.Zero && guard++ < 256)
+            {
+                if (cur == upperHwnd)
+                {
+                    return true;
+                }
+
+                cur = GetWindow(cur, GW_HWNDPREV);
+            }
+
+            return false;
+        }
+
+        private static nint FindVisibleNonTopmostWindowAbove(nint targetHwnd, nint panelHwnd)
+        {
+            if (targetHwnd == IntPtr.Zero || !IsWindow(targetHwnd))
+            {
+                return IntPtr.Zero;
+            }
+
+            nint cur = GetWindow(targetHwnd, GW_HWNDPREV);
+            int guard = 0;
+            while (cur != IntPtr.Zero && guard++ < 256)
+            {
+                if (cur != panelHwnd &&
+                    IsWindowVisible(cur) &&
+                    !IsWindowTopmost(cur) &&
+                    !IsWindowCloaked(cur))
+                {
+                    return cur;
+                }
+
+                cur = GetWindow(cur, GW_HWNDPREV);
+            }
+
+            return IntPtr.Zero;
+        }
+
+        private static nint GetWindowLongPtrCompat(nint hWnd, int nIndex)
+        {
+            return IntPtr.Size == 8
+                ? GetWindowLongPtr64(hWnd, nIndex)
+                : new nint(GetWindowLong32(hWnd, nIndex));
+        }
+
+        private const int InterCommandDelayMs = 150;
+
         internal static async Task<bool> InjectCommandAsync(nint targetHwnd, string command, bool execute)
         {
-            if (targetHwnd == IntPtr.Zero || !IsWindow(targetHwnd) || string.IsNullOrEmpty(command))
+            List<string> lines = CommandStore.ParseCommandLines(command);
+            if (targetHwnd == IntPtr.Zero || !IsWindow(targetHwnd) || lines.Count == 0)
             {
                 return false;
             }
@@ -257,31 +384,42 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
             SetForegroundWindow(targetHwnd);
             await Task.Delay(35).ConfigureAwait(false);
 
-            var inputs = new List<INPUT>(command.Length * 2 + 2);
-            for (int i = 0; i < command.Length; i++)
+            if (!execute)
             {
-                char ch = command[i];
-                if (ch == '\r')
-                {
-                    if (i + 1 < command.Length && command[i + 1] == '\n')
-                    {
-                        i++;
-                    }
-
-                    AddVirtualKey(inputs, VK_RETURN);
-                    continue;
-                }
-
-                if (ch == '\n')
-                {
-                    AddVirtualKey(inputs, VK_RETURN);
-                    continue;
-                }
-
-                AddUnicodeChar(inputs, ch);
+                string joined = lines.Count == 1 ? lines[0] : string.Join("; ", lines);
+                return SendTextLine(joined, pressEnter: false);
             }
 
-            if (execute)
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (!IsWindow(targetHwnd))
+                {
+                    return false;
+                }
+
+                if (!SendTextLine(lines[i], pressEnter: true))
+                {
+                    return false;
+                }
+
+                if (i < lines.Count - 1)
+                {
+                    await Task.Delay(InterCommandDelayMs).ConfigureAwait(false);
+                }
+            }
+
+            return true;
+        }
+
+        private static bool SendTextLine(string text, bool pressEnter)
+        {
+            var inputs = new List<INPUT>(text.Length * 2 + 2);
+            for (int i = 0; i < text.Length; i++)
+            {
+                AddUnicodeChar(inputs, text[i]);
+            }
+
+            if (pressEnter)
             {
                 AddVirtualKey(inputs, VK_RETURN);
             }
@@ -472,7 +610,19 @@ namespace Microsoft.Management.UI.Internal.CommandPanel
         private static extern int DwmGetWindowAttribute(nint hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
 
         [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(nint hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
+        [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+        [DllImport("user32.dll")]
+        private static extern nint GetWindow(nint hWnd, uint uCmd);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
+        private static extern int GetWindowLong32(nint hWnd, int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+        private static extern nint GetWindowLongPtr64(nint hWnd, int nIndex);
 
         [DllImport("user32.dll")]
         private static extern nint MonitorFromWindow(nint hwnd, uint dwFlags);

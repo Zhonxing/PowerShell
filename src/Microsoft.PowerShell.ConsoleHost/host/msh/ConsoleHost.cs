@@ -129,6 +129,11 @@ namespace Microsoft.PowerShell
             {
                 return CommandPanelLauncher.RunPanelProcess(s_cpp.CommandPanelTarget);
             }
+
+            if (s_cpp.CommandPanelToggle)
+            {
+                return CommandPanelLauncher.TogglePanelProcess();
+            }
 #endif
 
             // Put pwsh executable home in front of PATH so that calling `pwsh` within `pwsh` always starts the same running version.
@@ -337,7 +342,6 @@ namespace Microsoft.PowerShell
                 if (!s_cpp.NonInteractive && s_cpp.InitialCommand == null && s_cpp.File == null)
                 {
                     AdbDeviceWatcher.EnsureWatcherRunningAsync();
-                    CommandPanelLauncher.EnsurePanelRunningAsync(forceShow: false);
                 }
 #endif
 
@@ -1841,6 +1845,9 @@ namespace Microsoft.PowerShell
 
                 Runspace.PrimaryRunspace = consoleRunspace;
                 _runspaceRef = new RunspaceRef(consoleRunspace);
+#if !UNIX
+                AdbSessionInitializer.ApplyRunspaceDefaults(consoleRunspace);
+#endif
 
                 if (psReadlineFailed)
                 {

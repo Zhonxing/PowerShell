@@ -25,6 +25,8 @@ namespace Microsoft.PowerShell.Adb
         private const string AdbHost = "127.0.0.1";
         private const int AdbPort = 5037;
         private const string TrackDevicesCommand = "0012host:track-devices";
+        private static readonly object s_syncLock = new();
+        private static IReadOnlyList<string> s_lastDevices = Array.Empty<string>();
 
         /// <summary>
         /// Asynchronously ensures the single-instance watcher process is running when Windows Terminal is installed.
@@ -97,53 +99,65 @@ namespace Microsoft.PowerShell.Adb
             // Write initial base fragment immediately so SuperPowerShell appears in WT even before adb connects.
             TryWriteFragment(Array.Empty<string>());
 
-            bool triedStartServer = false;
-
-            while (true)
+            using var settingsSyncTimer = new Timer(_ => TryWriteFragment(s_lastDevices), null, Timeout.Infinite, Timeout.Infinite);
+            List<FileSystemWatcher> settingsWatchers = StartSettingsWatchers(settingsSyncTimer);
+            try
             {
-                try
+                bool triedStartServer = false;
+
+                while (true)
                 {
-                    using var client = new TcpClient();
-                    client.Connect(AdbHost, AdbPort);
-                    triedStartServer = false;
-
-                    using NetworkStream stream = client.GetStream();
-                    byte[] cmdBytes = Encoding.ASCII.GetBytes(TrackDevicesCommand);
-                    stream.Write(cmdBytes, 0, cmdBytes.Length);
-                    stream.Flush();
-
-                    string status = ReadExactAscii(stream, 4);
-                    if (!string.Equals(status, "OKAY", StringComparison.Ordinal))
+                    try
                     {
-                        Thread.Sleep(3000);
-                        continue;
-                    }
+                        using var client = new TcpClient();
+                        client.Connect(AdbHost, AdbPort);
+                        triedStartServer = false;
 
-                    while (true)
-                    {
-                        string lenHex = ReadExactAscii(stream, 4);
-                        if (!int.TryParse(lenHex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int payloadLen))
+                        using NetworkStream stream = client.GetStream();
+                        byte[] cmdBytes = Encoding.ASCII.GetBytes(TrackDevicesCommand);
+                        stream.Write(cmdBytes, 0, cmdBytes.Length);
+                        stream.Flush();
+
+                        string status = ReadExactAscii(stream, 4);
+                        if (!string.Equals(status, "OKAY", StringComparison.Ordinal))
                         {
-                            break;
+                            Thread.Sleep(3000);
+                            continue;
                         }
 
-                        string payload = payloadLen > 0 ? ReadExactUtf8(stream, payloadLen) : string.Empty;
-                        List<string> devices = ParseOnlineDevices(payload);
-                        TryWriteFragment(devices);
+                        while (true)
+                        {
+                            string lenHex = ReadExactAscii(stream, 4);
+                            if (!int.TryParse(lenHex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int payloadLen))
+                            {
+                                break;
+                            }
+
+                            string payload = payloadLen > 0 ? ReadExactUtf8(stream, payloadLen) : string.Empty;
+                            List<string> devices = ParseOnlineDevices(payload);
+                            TryWriteFragment(devices);
+                        }
+                    }
+                    catch
+                    {
+                        if (!triedStartServer)
+                        {
+                            triedStartServer = true;
+                            TryStartAdbServer();
+                            Thread.Sleep(1000);
+                        }
+                        else
+                        {
+                            Thread.Sleep(3000);
+                        }
                     }
                 }
-                catch
+            }
+            finally
+            {
+                foreach (FileSystemWatcher watcher in settingsWatchers)
                 {
-                    if (!triedStartServer)
-                    {
-                        triedStartServer = true;
-                        TryStartAdbServer();
-                        Thread.Sleep(1000);
-                    }
-                    else
-                    {
-                        Thread.Sleep(3000);
-                    }
+                    watcher.Dispose();
                 }
             }
         }
@@ -175,15 +189,72 @@ namespace Microsoft.PowerShell.Adb
             return serials;
         }
 
+        private static List<FileSystemWatcher> StartSettingsWatchers(Timer debounceTimer)
+        {
+            var watchers = new List<FileSystemWatcher>();
+            var watchedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string settingsPath in AdbTerminalSync.GetWindowsTerminalSettingsPaths())
+            {
+                string? dir = Path.GetDirectoryName(settingsPath);
+                if (string.IsNullOrEmpty(dir) || !watchedDirs.Add(dir))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var watcher = new FileSystemWatcher(dir)
+                    {
+                        Filter = "*",
+                        NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
+                        EnableRaisingEvents = true,
+                    };
+
+                    void OnSettingsEvent(string? name)
+                    {
+                        if (!string.Equals(name, "settings.json", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return;
+                        }
+
+                        try
+                        {
+                            debounceTimer.Change(400, Timeout.Infinite);
+                        }
+                        catch
+                        {
+                            // Ignore if timer disposed on exit.
+                        }
+                    }
+
+                    watcher.Changed += (_, e) => OnSettingsEvent(e.Name);
+                    watcher.Created += (_, e) => OnSettingsEvent(e.Name);
+                    watcher.Renamed += (_, e) => OnSettingsEvent(e.Name);
+                    watchers.Add(watcher);
+                }
+                catch
+                {
+                    // Best-effort settings watcher.
+                }
+            }
+
+            return watchers;
+        }
+
         private static void TryWriteFragment(IReadOnlyList<string> devices)
         {
-            try
+            lock (s_syncLock)
             {
-                AdbTerminalSync.WriteFragment(devices);
-            }
-            catch
-            {
-                // Ignore transient filesystem errors.
+                s_lastDevices = devices;
+                try
+                {
+                    AdbTerminalSync.WriteFragment(devices);
+                }
+                catch
+                {
+                    // Ignore transient filesystem errors.
+                }
             }
         }
 
